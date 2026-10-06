@@ -7,6 +7,7 @@ mod fetch;
 mod mcp;
 mod multiplexer;
 mod output;
+mod raw;
 mod repo;
 pub mod sanitize;
 pub mod search;
@@ -15,6 +16,7 @@ mod theme;
 mod tui;
 mod ui;
 pub mod util;
+mod web;
 
 use std::sync::Arc;
 
@@ -33,7 +35,7 @@ async fn main() -> Result<()> {
     // with completions (including alias names) and exit immediately.
     clap_complete::CompleteEnv::with_factory(Cli::command).complete();
 
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
 
     // Suppress icechunk's internal ERROR logs by default — they fire during
     // normal shutdown when manifest pre-load tasks are cancelled, and look
@@ -71,12 +73,60 @@ async fn main() -> Result<()> {
             let merged_anon = script_anon || cli.anonymous;
             let merged_api = arraylake_api.clone().or(cli.arraylake_api.clone());
             return run_script(
-                cli.repo.as_deref(), filename, branch, snapshot.as_deref(), path.as_deref(),
-                merged_region, merged_endpoint, merged_anon, merged_api.as_deref(),
-                marimo, force, run,
+                cli.repo.as_deref(),
+                filename,
+                branch,
+                snapshot.as_deref(),
+                path.as_deref(),
+                merged_region,
+                merged_endpoint,
+                merged_anon,
+                merged_api.as_deref(),
+                marimo,
+                force,
+                run,
             );
         }
         _ => {}
+    }
+
+    // Commands that produce output default to markdown if no --output is given.
+    // This avoids accidentally launching the TUI when running e.g. `core-drill <repo> storage-size`.
+    let has_output_command = matches!(
+        cli.command,
+        Some(
+            cli::Command::Branches
+                | cli::Command::Tags
+                | cli::Command::Log { .. }
+                | cli::Command::Tree { .. }
+                | cli::Command::OpsLog { .. }
+                | cli::Command::StorageSize
+                | cli::Command::Object { .. }
+                | cli::Command::ChunkRef { .. }
+                | cli::Command::ChunkChanges { .. }
+                | cli::Command::Info
+        )
+    );
+    if has_output_command && cli.output.is_none() {
+        cli.output = Some(cli::OutputFormat::Md);
+    }
+
+    if let Some(cli::Command::Web { port, no_open }) = cli.command {
+        let repo_str = cli
+            .repo
+            .clone()
+            .ok_or_else(|| color_eyre::eyre::eyre!("A repo argument is required"))?;
+        let (repository, repo_id) = open_repo(
+            &repo_str,
+            cli.arraylake_api.as_deref(),
+            &repo::StorageOverrides {
+                region: cli.region.clone(),
+                endpoint_url: cli.endpoint_url.clone(),
+                anonymous: cli.anonymous,
+            },
+        )
+        .await?;
+        return web::serve(repository, repo_id.display_short(), port, !no_open).await;
     }
 
     // For TUI mode (no --output, --serve, --repl), show loading screen while opening
@@ -116,9 +166,7 @@ async fn main() -> Result<()> {
 
         tui::run_with_loading(
             &label,
-            async move {
-                open_repo(&repo_str, api_url.as_deref(), &overrides).await
-            },
+            async move { open_repo(&repo_str, api_url.as_deref(), &overrides).await },
             |(repository, repo_id)| {
                 let data_store = store::DataStore::new(repository);
                 app::App::new(data_store, repo_id)
@@ -176,9 +224,7 @@ pub async fn open_repo(
             endpoint_url: overrides.endpoint_url.clone().or(alias.endpoint_url),
             anonymous: overrides.anonymous || alias.anonymous,
         };
-        resolved_api = arraylake_api
-            .map(|s| s.to_string())
-            .or(alias.arraylake_api);
+        resolved_api = arraylake_api.map(|s| s.to_string()).or(alias.arraylake_api);
     } else {
         resolved = repo_str.to_string();
         resolved_overrides = repo::StorageOverrides {
@@ -256,7 +302,7 @@ async fn open_via_arraylake(
         .ok_or_else(|| color_eyre::eyre::eyre!("No id_token in Arraylake token file"))?;
 
     let client = Arc::new(
-        arraylake::ALClient::new(api_url.map(|s| s.to_string()), id_token.to_string())
+        arraylake::ALClient::new(api_url.map(|s| s.to_string()), Some(id_token.to_string()))
             .map_err(|e| color_eyre::eyre::eyre!("Failed to create Arraylake client: {e}"))?,
     );
 
@@ -276,16 +322,13 @@ async fn open_via_arraylake(
         )
     })?;
 
-    // Extract bucket metadata once — used for display and the identity struct
-    let bucket_name = repo_info
-        .bucket
-        .as_ref()
-        .map(|b| b.name.as_str())
-        .unwrap_or("?");
+    // Extract bucket metadata once — used for display and the identity struct.
+    // A marketplace subscription has no bucket of its own; it reads its
+    // parent repo's storage.
+    let effective_bucket = repo_info.effective_storage().ok().map(|(b, _)| b);
+    let bucket_name = effective_bucket.map(|b| b.name.as_str()).unwrap_or("?");
 
-    let region = repo_info
-        .bucket
-        .as_ref()
+    let region = effective_bucket
         .and_then(|b| {
             b.extra_config.get("region_name").map(|v| match v {
                 arraylake::ALBucketExtraConfigValue::S(s) => s.clone(),
@@ -294,9 +337,7 @@ async fn open_via_arraylake(
         })
         .unwrap_or_else(|| "?".to_string());
 
-    let platform = repo_info
-        .bucket
-        .as_ref()
+    let platform = effective_bucket
         .map(|b| {
             let endpoint = b.extra_config.get("endpoint_url").and_then(|v| match v {
                 arraylake::ALBucketExtraConfigValue::S(s) => Some(s.as_str()),
@@ -312,6 +353,7 @@ async fn open_via_arraylake(
                 arraylake::ALBucketPlatform::S3Compatible => "S3-compatible".to_string(),
                 arraylake::ALBucketPlatform::Minio => "MinIO".to_string(),
                 arraylake::ALBucketPlatform::GS => "GCS".to_string(),
+                arraylake::ALBucketPlatform::Azure => "Azure".to_string(),
             }
         })
         .unwrap_or_else(|| "?".to_string());
@@ -319,7 +361,7 @@ async fn open_via_arraylake(
     tracing::info!("Arraylake: {org}/{repo_name}  →  {bucket_name} ({platform}, {region})");
 
     let storage = client
-        .get_storage_for_repo(&repo_info)
+        .get_storage_for_repo(&repo_info, None)
         .await
         .map_err(|e| color_eyre::eyre::eyre!("Failed to get storage for '{ref_str}': {e}"))?;
 
@@ -406,7 +448,9 @@ fn run_alias_command(command: cli::AliasCommand) -> Result<()> {
                 config::save(&cfg)?;
                 println!("Removed alias '{name}'");
             } else {
-                color_eyre::eyre::bail!("No alias named '{name}'. Run `core-drill alias list` to see available aliases.");
+                color_eyre::eyre::bail!(
+                    "No alias named '{name}'. Run `core-drill alias list` to see available aliases."
+                );
             }
         }
     }
@@ -420,9 +464,7 @@ fn run_script_deps_command(command: cli::ScriptDepsCommand) -> Result<()> {
             let cfg = config::load()?;
             if cfg.script_deps.is_empty() {
                 println!("No extra script dependencies configured.");
-                println!(
-                    "\nAdd some with: core-drill script-deps add matplotlib pandas"
-                );
+                println!("\nAdd some with: core-drill script-deps add matplotlib pandas");
             } else {
                 for dep in &cfg.script_deps {
                     println!("  {dep}");
@@ -474,14 +516,8 @@ fn install_completions(shell_override: Option<clap_complete::Shell>) -> Result<(
         .ok_or_else(|| color_eyre::eyre::eyre!("Cannot determine home directory"))?;
 
     let (rc_path, eval_line) = match shell {
-        Shell::Zsh => (
-            home.join(".zshrc"),
-            "source <(COMPLETE=zsh core-drill)",
-        ),
-        Shell::Bash => (
-            home.join(".bashrc"),
-            "source <(COMPLETE=bash core-drill)",
-        ),
+        Shell::Zsh => (home.join(".zshrc"), "source <(COMPLETE=zsh core-drill)"),
+        Shell::Bash => (home.join(".bashrc"), "source <(COMPLETE=bash core-drill)"),
         Shell::Fish => (
             home.join(".config/fish/config.fish"),
             "COMPLETE=fish core-drill | source",
@@ -546,12 +582,9 @@ fn extract_diffable(content: &str, filename: &str) -> String {
                 c["metadata"]["jupyter"]["source_hidden"].as_bool() != Some(true)
             })
             .filter_map(|c| {
-                c["source"].as_array().map(|lines| {
-                    lines
-                        .iter()
-                        .filter_map(|l| l.as_str())
-                        .collect::<String>()
-                })
+                c["source"]
+                    .as_array()
+                    .map(|lines| lines.iter().filter_map(|l| l.as_str()).collect::<String>())
             })
             .collect::<Vec<_>>()
             .join("\n");
@@ -629,7 +662,13 @@ fn run_script(
         };
 
     let resolved_api = arraylake_api.map(|s| s.to_string());
-    let identity = app::RepoIdentity::from_url(&resolved, resolved_region, resolved_endpoint, resolved_anon, resolved_api);
+    let identity = app::RepoIdentity::from_url(
+        &resolved,
+        resolved_region,
+        resolved_endpoint,
+        resolved_anon,
+        resolved_api,
+    );
     let ctx = codegen::CodeContext {
         branch: branch.to_string(),
         snapshot: snapshot.map(|s| s.to_string()),
@@ -643,7 +682,9 @@ fn run_script(
     if dest.exists() {
         let existing = std::fs::read_to_string(dest)?;
         if existing != content && !force {
-            eprintln!("\x1b[31merror:\x1b[0m File '{filename}' already exists with different content. Use --force to overwrite.\n");
+            eprintln!(
+                "\x1b[31merror:\x1b[0m File '{filename}' already exists with different content. Use --force to overwrite.\n"
+            );
             // For notebooks, diff the Python code content, not the raw JSON
             let old_text = extract_diffable(&existing, filename);
             let new_text = extract_diffable(&content, filename);
@@ -658,7 +699,10 @@ fn run_script(
     }
 
     if !exec {
-        println!("Written to \x1b[1m{filename}\x1b[0m, run with:\n\n  {}\n", codegen::run_hint(&format, filename));
+        println!(
+            "Written to \x1b[1m{filename}\x1b[0m, run with:\n\n  {}\n",
+            codegen::run_hint(&format, filename)
+        );
     }
 
     if exec {

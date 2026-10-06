@@ -46,7 +46,7 @@ nix profile install github:earth-mover/core-drill
 ### From source
 
 ```bash
-cargo install --git https://github.com/earth-mover/core-drill
+cargo install --locked --git https://github.com/earth-mover/core-drill
 ```
 
 ## Usage
@@ -148,6 +148,26 @@ In the interactive TUI, press `y` then:
 - `r` — yank a Rust connection snippet to clipboard
 
 The snippets react to the current branch/snapshot and tree selection.
+
+## Format-level inspection
+
+Decode Icechunk's metadata files (repo info, snapshots, manifests, transaction logs) as flatbuffers, field by field:
+
+```bash
+core-drill ./repo object main                         # snapshot at the tip of main
+core-drill ./repo object transactions/main            # what the last commit recorded
+core-drill ./repo object manifests/<id> --at arrays/0/refs/0..20
+core-drill ./repo chunk-ref /temperature 0,3,1        # manifest entry for one chunk, incl. virtual checksums
+core-drill ./repo chunk-changes main                  # chunks a commit added, overwrote, or deleted
+```
+
+To click through the same files in your browser:
+
+```bash
+core-drill ./repo web          # also works for s3://, gs://, and al: repos
+```
+
+See [DOCS/raw-inspection.md](DOCS/raw-inspection.md) and [web/README.md](web/README.md).
 
 ## Updating
 
